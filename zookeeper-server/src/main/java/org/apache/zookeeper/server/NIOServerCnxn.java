@@ -40,6 +40,7 @@ import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.ZooDefs;
 import org.apache.zookeeper.data.Id;
 import org.apache.zookeeper.data.Stat;
+import org.apache.zookeeper.proto.ConnectRequest;
 import org.apache.zookeeper.proto.ReplyHeader;
 import org.apache.zookeeper.proto.WatcherEvent;
 import org.apache.zookeeper.server.NIOServerCnxnFactory.SelectorThread;
@@ -330,7 +331,15 @@ public class NIOServerCnxn extends ServerCnxn {
             if (k.isReadable()) {
                 int rc = sock.read(incomingBuffer);
                 if (rc < 0) {
-                    handleFailedRead();
+                    try {
+                        handleFailedRead();
+                    } catch (EndOfStreamException e) {
+                        // no stacktrace. this case is very common, and it is usually not a problem.
+                        LOG.info("{}", e.getMessage());
+                        // expecting close to log session closure
+                        close(e.getReason());
+                        return;
+                    }
                 }
                 if (incomingBuffer.remaining() == 0) {
                     boolean isPayload;
@@ -419,11 +428,13 @@ public class NIOServerCnxn extends ServerCnxn {
         }
     }
 
-    private void readConnectRequest() throws IOException, InterruptedException, ClientCnxnLimitException {
+    private void readConnectRequest() throws IOException, ClientCnxnLimitException {
         if (!isZKServerRunning()) {
             throw new IOException("ZooKeeperServer not running");
         }
-        zkServer.processConnectRequest(this, incomingBuffer);
+        BinaryInputArchive bia = BinaryInputArchive.getArchive(new ByteBufferInputStream(incomingBuffer));
+        ConnectRequest request = protocolManager.deserializeConnectRequest(bia);
+        zkServer.processConnectRequest(this, request);
         initialized = true;
     }
 

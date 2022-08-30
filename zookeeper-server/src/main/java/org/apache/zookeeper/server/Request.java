@@ -19,6 +19,7 @@
 package org.apache.zookeeper.server;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.List;
 import org.apache.jute.Record;
@@ -78,7 +79,29 @@ public class Request {
 
     public final int type;
 
-    public final ByteBuffer request;
+    private final ByteBuffer request;
+
+    public void readRequestRecord(Record record) throws IOException {
+        if (request != null) {
+            request.rewind();
+            ByteBufferInputStream.byteBuffer2Record(request, record);
+            request.rewind();
+            return;
+        }
+        throw new IOException(new NullPointerException("request"));
+    }
+
+    public byte[] readRequestBytes() {
+        if (request != null) {
+            request.rewind();
+            int len = request.remaining();
+            byte[] b = new byte[len];
+            request.get(b);
+            request.rewind();
+            return b;
+        }
+        return null;
+    }
 
     public final ServerCnxn cnxn;
 
@@ -355,7 +378,7 @@ public class Request {
             case OpCode.deleteContainer:
                 return "deleteContainer";
             case OpCode.createTTL:
-                return "createTtl";
+                return "createTTL";
             case OpCode.multiRead:
                 return "multiRead";
             case OpCode.auth:
@@ -364,6 +387,8 @@ public class Request {
                 return "setWatches";
             case OpCode.setWatches2:
                 return "setWatches2";
+            case OpCode.addWatch:
+                return "addWatch";
             case OpCode.sasl:
                 return "sasl";
             case OpCode.getEphemerals:

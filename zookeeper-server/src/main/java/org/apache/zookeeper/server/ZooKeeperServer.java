@@ -110,7 +110,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
 
     // When enabled, will check ACL constraints appertained to the requests first,
     // before sending the requests to the quorum.
-    static final boolean enableEagerACLCheck;
+    static boolean enableEagerACLCheck;
 
     static final boolean skipACL;
 
@@ -155,6 +155,17 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         closeSessionTxnEnabled = Boolean.parseBoolean(
                 System.getProperty(CLOSE_SESSION_TXN_ENABLED, "true"));
         LOG.info("{} = {}", CLOSE_SESSION_TXN_ENABLED, closeSessionTxnEnabled);
+    }
+
+    // @VisibleForTesting
+    public static boolean isEnableEagerACLCheck() {
+        return enableEagerACLCheck;
+    }
+
+    // @VisibleForTesting
+    public static void setEnableEagerACLCheck(boolean enabled) {
+        ZooKeeperServer.enableEagerACLCheck = enabled;
+        LOG.info("Update {} to {}", ENABLE_EAGER_ACL_CHECK, enabled);
     }
 
     public static boolean isCloseSessionTxnEnabled() {
@@ -1062,14 +1073,12 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
                 valid ? cnxn.getSessionTimeout() : 0,
                 valid ? cnxn.getSessionId() : 0, // send 0 if session is no
                 // longer valid
-                valid ? generatePasswd(cnxn.getSessionId()) : new byte[16]);
+                valid ? generatePasswd(cnxn.getSessionId()) : new byte[16],
+                this instanceof ReadOnlyZooKeeperServer);
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             BinaryOutputArchive bos = BinaryOutputArchive.getArchive(baos);
             bos.writeInt(-1, "len");
             rsp.serialize(bos, "connect");
-            if (!cnxn.isOldClient) {
-                bos.writeBool(this instanceof ReadOnlyZooKeeperServer, "readOnly");
-            }
             baos.close();
             ByteBuffer bb = ByteBuffer.wrap(baos.toByteArray());
             bb.putInt(bb.remaining() - 4).rewind();
@@ -1366,18 +1375,13 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
     }
 
     @SuppressFBWarnings(value = "IS2_INCONSISTENT_SYNC", justification = "the value won't change after startup")
-    public void processConnectRequest(ServerCnxn cnxn, ByteBuffer incomingBuffer)
-        throws IOException, ClientCnxnLimitException {
-
-        BinaryInputArchive bia = BinaryInputArchive.getArchive(new ByteBufferInputStream(incomingBuffer));
-        ConnectRequest connReq = new ConnectRequest();
-        connReq.deserialize(bia, "connect");
+    public void processConnectRequest(ServerCnxn cnxn, ConnectRequest request) throws IOException, ClientCnxnLimitException {
         LOG.debug(
             "Session establishment request from client {} client's lastZxid is 0x{}",
             cnxn.getRemoteSocketAddress(),
-            Long.toHexString(connReq.getLastZxidSeen()));
+            Long.toHexString(request.getLastZxidSeen()));
 
-        long sessionId = connReq.getSessionId();
+        long sessionId = request.getSessionId();
         int tokensNeeded = 1;
         if (connThrottle.isConnectionWeightEnabled()) {
             if (sessionId == 0) {
@@ -1395,30 +1399,24 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
             throw new ClientCnxnLimitException();
         }
         ServerMetrics.getMetrics().CONNECTION_TOKEN_DEFICIT.add(connThrottle.getDeficit());
-
         ServerMetrics.getMetrics().CONNECTION_REQUEST_COUNT.add(1);
 
-        boolean readOnly = false;
-        try {
-            readOnly = bia.readBool("readOnly");
-            cnxn.isOldClient = false;
-        } catch (IOException e) {
-            // this is ok -- just a packet from an old client which
-            // doesn't contain readOnly field
+        if (!cnxn.protocolManager.isReadonlyAvailable()) {
             LOG.warn(
                 "Connection request from old client {}; will be dropped if server is in r-o mode",
                 cnxn.getRemoteSocketAddress());
         }
-        if (!readOnly && this instanceof ReadOnlyZooKeeperServer) {
+
+        if (!request.getReadOnly() && this instanceof ReadOnlyZooKeeperServer) {
             String msg = "Refusing session request for not-read-only client " + cnxn.getRemoteSocketAddress();
             LOG.info(msg);
             throw new CloseRequestException(msg, ServerCnxn.DisconnectReason.NOT_READ_ONLY_CLIENT);
         }
-        if (connReq.getLastZxidSeen() > zkDb.dataTree.lastProcessedZxid) {
+        if (request.getLastZxidSeen() > zkDb.dataTree.lastProcessedZxid) {
             String msg = "Refusing session request for client "
                          + cnxn.getRemoteSocketAddress()
                          + " as it has seen zxid 0x"
-                         + Long.toHexString(connReq.getLastZxidSeen())
+                         + Long.toHexString(request.getLastZxidSeen())
                          + " our last zxid is 0x"
                          + Long.toHexString(getZKDatabase().getDataTreeLastProcessedZxid())
                          + " client must try another server";
@@ -1426,8 +1424,8 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
             LOG.info(msg);
             throw new CloseRequestException(msg, ServerCnxn.DisconnectReason.CLIENT_ZXID_AHEAD);
         }
-        int sessionTimeout = connReq.getTimeOut();
-        byte[] passwd = connReq.getPasswd();
+        int sessionTimeout = request.getTimeOut();
+        byte[] passwd = request.getPasswd();
         int minSessionTimeout = getMinSessionTimeout();
         if (sessionTimeout < minSessionTimeout) {
             sessionTimeout = minSessionTimeout;
@@ -1445,16 +1443,16 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
             LOG.debug(
                 "Client attempting to establish new session: session = 0x{}, zxid = 0x{}, timeout = {}, address = {}",
                 Long.toHexString(id),
-                Long.toHexString(connReq.getLastZxidSeen()),
-                connReq.getTimeOut(),
+                Long.toHexString(request.getLastZxidSeen()),
+                request.getTimeOut(),
                 cnxn.getRemoteSocketAddress());
         } else {
             validateSession(cnxn, sessionId);
             LOG.debug(
                 "Client attempting to renew session: session = 0x{}, zxid = 0x{}, timeout = {}, address = {}",
                 Long.toHexString(sessionId),
-                Long.toHexString(connReq.getLastZxidSeen()),
-                connReq.getTimeOut(),
+                Long.toHexString(request.getLastZxidSeen()),
+                request.getTimeOut(),
                 cnxn.getRemoteSocketAddress());
             if (serverCnxnFactory != null) {
                 serverCnxnFactory.closeSession(sessionId, ServerCnxn.DisconnectReason.CLIENT_RECONNECT);
@@ -2180,7 +2178,7 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         case OpCode.create:
         case OpCode.create2: {
             CreateRequest req = new CreateRequest();
-            if (buffer2Record(request.request, req)) {
+            if (readRequestRecord(request, req)) {
                 mustCheckACL = true;
                 acl = req.getAcl();
                 path = parentPath(req.getPath());
@@ -2189,21 +2187,21 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         }
         case OpCode.delete: {
             DeleteRequest req = new DeleteRequest();
-            if (buffer2Record(request.request, req)) {
+            if (readRequestRecord(request, req)) {
                 path = parentPath(req.getPath());
             }
             break;
         }
         case OpCode.setData: {
             SetDataRequest req = new SetDataRequest();
-            if (buffer2Record(request.request, req)) {
+            if (readRequestRecord(request, req)) {
                 path = req.getPath();
             }
             break;
         }
         case OpCode.setACL: {
             SetACLRequest req = new SetACLRequest();
-            if (buffer2Record(request.request, req)) {
+            if (readRequestRecord(request, req)) {
                 mustCheckACL = true;
                 acl = req.getAcl();
                 path = req.getPath();
@@ -2297,16 +2295,13 @@ public class ZooKeeperServer implements SessionExpirer, ServerStats.Provider {
         return err == KeeperException.Code.OK.intValue();
     }
 
-    private boolean buffer2Record(ByteBuffer request, Record record) {
-        boolean rv = false;
+    private boolean readRequestRecord(Request request, Record record) {
         try {
-            ByteBufferInputStream.byteBuffer2Record(request, record);
-            request.rewind();
-            rv = true;
+            request.readRequestRecord(record);
+            return true;
         } catch (IOException ex) {
+            return false;
         }
-
-        return rv;
     }
 
     public int getOutstandingHandshakeNum() {
